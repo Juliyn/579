@@ -11,10 +11,10 @@ from flask import Flask, Response, jsonify, render_template_string
 
 CAMERA_NUMBER = 0
 
-# Calibration - PRESERVED
+# Original calibration preserved
 MM_PER_PIXEL = 0.36339648
 
-# Camera inspection area
+# Camera inspection area in the original camera frame
 X1, Y1 = 150, 70
 X2, Y2 = 650, 570
 
@@ -27,7 +27,7 @@ MIN_SQUARE_RATIO = 0.60
 MAX_CENTER_OFFSET_RATIO = 0.30
 MIN_INNER_DIMENSION = 20
 
-# White cylinder detection
+# Cylinder detection
 WHITE_MIN_BRIGHTNESS = 100
 WHITE_MAX_SATURATION = 150
 MIN_CYLINDER_AREA_RATIO = 0.08
@@ -36,6 +36,9 @@ MIN_CYLINDER_RADIUS = 5
 CYLINDER_INSET_RATIO = 0.06
 CYLINDER_MIN_AREA = 30
 
+# Fit-gap threshold preserved from your current code
+MAX_FIT_GAP_MM2 = 160
+
 # Display colors (BGR)
 RED = (0, 0, 255)
 GREEN = (0, 255, 0)
@@ -43,18 +46,15 @@ YELLOW = (0, 255, 255)
 CYAN = (255, 255, 0)
 WHITE = (255, 255, 255)
 BLUE = (255, 120, 0)
-ORANGE = (0, 165, 255)
 PURPLE = (255, 0, 255)
-DARK_PANEL = (25, 25, 25)
+ORANGE = (0, 165, 255)
 
 # ============================================================
-# SHARED CAMERA AND MEASUREMENT DATA
+# SHARED DATA
 # ============================================================
 
 app = Flask(__name__)
-
 data_lock = threading.Lock()
-
 latest_jpeg = None
 
 measurements = {
@@ -83,134 +83,249 @@ def update_measurements(**kwargs):
         measurements["updated"] = time.time()
 
 
-def reset_measurements():
-    update_measurements(
-        part_detected=False,
-        inner_square_detected=False,
-        length=None,
-        width=None,
-        inner_area=None,
-        top_wall=None,
-        bottom_wall=None,
-        left_wall=None,
-        right_wall=None,
-        cylinder_detected=False,
-        cylinder_diameter=None,
-        cylinder_area=None,
-        fit_gap=None,
-        fit_state="WAITING"
-    )
+def empty_measurements():
+    return {
+        "camera": "LIVE",
+        "part_detected": False,
+        "inner_square_detected": False,
+        "length": None,
+        "width": None,
+        "inner_area": None,
+        "top_wall": None,
+        "bottom_wall": None,
+        "left_wall": None,
+        "right_wall": None,
+        "cylinder_detected": False,
+        "cylinder_diameter": None,
+        "cylinder_area": None,
+        "fit_gap": None,
+        "fit_state": "WAITING"
+    }
 
 
 # ============================================================
-# WALL THICKNESS MEASUREMENT
+# ROTATION-AWARE GEOMETRY
+# ============================================================
+
+def get_rotated_box(contour):
+    """
+    Returns the rotated rectangle corners and its two local axes.
+    The axes follow the object's orientation in the image.
+    """
+    rect = cv2.minAreaRect(contour)
+    corners = cv2.boxPoints(rect).astype(np.float32)
+
+    edge_a = corners[1] - corners[0]
+    edge_b = corners[3] - corners[0]
+
+    len_a = np.linalg.norm(edge_a)
+    len_b = np.linalg.norm(edge_b)
+
+    if len_a <= 0 or len_b <= 0:
+        return None
+
+    axis_a = edge_a / len_a
+    axis_b = edge_b / len_b
+
+    return rect, corners, axis_a, axis_b
+
+
+def project_contour(contour, axis_a, axis_b):
+    """Projects contour points onto the block's local axes."""
+    points = contour.reshape(-1, 2).astype(np.float32)
+
+    projection_a = points @ axis_a
+    projection_b = points @ axis_b
+
+    return projection_a, projection_b
+
+
+def point_from_local(a, b, axis_a, axis_b):
+    """Converts coordinates in the local axes back to image pixels."""
+    point = axis_a * a + axis_b * b
+    return tuple(np.round(point).astype(int))
+
+
+def draw_rotated_outline(display, contour, color, thickness=2):
+    rect = cv2.minAreaRect(contour)
+    corners = cv2.boxPoints(rect).astype(np.int32)
+
+    cv2.polylines(
+        display,
+        [corners],
+        True,
+        color,
+        thickness,
+        cv2.LINE_AA
+    )
+
+    return corners
+
+
+# ============================================================
+# ROTATION-AWARE WALL MEASUREMENTS
 # ============================================================
 
 def measure_four_walls(outer_contour, inner_contour):
+    """
+    Measures four wall thicknesses along the rotated block axes.
 
-    ox, oy, ow, oh = cv2.boundingRect(outer_contour)
-    ix, iy, iw, ih = cv2.boundingRect(inner_contour)
+    This is more rotation-aware than measuring boundingRect offsets.
+    It assumes the outer block and inner opening have approximately
+    parallel corresponding edges.
+    """
+    geometry = get_rotated_box(outer_contour)
 
-    if ow <= 0 or oh <= 0 or iw <= 0 or ih <= 0:
+    if geometry is None:
         return None
 
+    _, _, axis_a, axis_b = geometry
+
+    outer_a, outer_b = project_contour(
+        outer_contour, axis_a, axis_b
+    )
+
+    inner_a, inner_b = project_contour(
+        inner_contour, axis_a, axis_b
+    )
+
+    oa_min, oa_max = outer_a.min(), outer_a.max()
+    ob_min, ob_max = outer_b.min(), outer_b.max()
+
+    ia_min, ia_max = inner_a.min(), inner_a.max()
+    ib_min, ib_max = inner_b.min(), inner_b.max()
+
+    # Confirm that the inner opening is within the outer contour.
     if (
-        ix <= ox or
-        iy <= oy or
-        ix + iw >= ox + ow or
-        iy + ih >= oy + oh
+        ia_min <= oa_min or ia_max >= oa_max or
+        ib_min <= ob_min or ib_max >= ob_max
     ):
         return None
 
     walls_px = {
-        "Top": iy - oy,
-        "Bottom": (oy + oh) - (iy + ih),
-        "Left": ix - ox,
-        "Right": (ox + ow) - (ix + iw)
+        "Left": ia_min - oa_min,
+        "Right": oa_max - ia_max,
+        "Top": ib_min - ob_min,
+        "Bottom": ob_max - ib_max
     }
 
-    results = {}
+    if any(value <= 0 for value in walls_px.values()):
+        return None
 
-    for label, thickness_px in walls_px.items():
-
-        if thickness_px <= 0:
-            return None
-
-        results[label] = {
-            "thickness_px": float(thickness_px),
-            "thickness_mm": thickness_px * MM_PER_PIXEL
+    return {
+        name: {
+            "thickness_px": float(value),
+            "thickness_mm": float(value * MM_PER_PIXEL)
         }
-
-    return results
+        for name, value in walls_px.items()
+    }
 
 
 def draw_wall_measurements(display, outer_contour, inner_contour):
-
     result = measure_four_walls(
-        outer_contour,
-        inner_contour
+        outer_contour, inner_contour
     )
 
     if result is None:
         return None
 
-    ox, oy, ow, oh = cv2.boundingRect(outer_contour)
-    ix, iy, iw, ih = cv2.boundingRect(inner_contour)
+    geometry = get_rotated_box(outer_contour)
 
-    cv2.rectangle(
-        display, (ox, oy), (ox + ow, oy + oh), BLUE, 2
+    if geometry is None:
+        return None
+
+    _, outer_corners, axis_a, axis_b = geometry
+
+    inner_geometry = get_rotated_box(inner_contour)
+
+    if inner_geometry is None:
+        return None
+
+    _, inner_corners, _, _ = inner_geometry
+
+    cv2.polylines(
+        display, [outer_corners.astype(np.int32)],
+        True, BLUE, 2, cv2.LINE_AA
     )
 
-    cv2.rectangle(
-        display, (ix, iy), (ix + iw, iy + ih), GREEN, 2
+    cv2.polylines(
+        display, [inner_corners.astype(np.int32)],
+        True, GREEN, 2, cv2.LINE_AA
     )
 
-    outer_cx = ox + ow // 2
-    inner_cy = iy + ih // 2
-
-    # Measurement lines
-    cv2.line(
-        display, (outer_cx, oy), (outer_cx, iy),
-        YELLOW, 2, cv2.LINE_AA
+    outer_a, outer_b = project_contour(
+        outer_contour, axis_a, axis_b
     )
 
-    cv2.line(
-        display, (outer_cx, iy + ih),
-        (outer_cx, oy + oh), YELLOW, 2, cv2.LINE_AA
+    inner_a, inner_b = project_contour(
+        inner_contour, axis_a, axis_b
     )
 
-    cv2.line(
-        display, (ox, inner_cy), (ix, inner_cy),
-        YELLOW, 2, cv2.LINE_AA
-    )
+    oa_min, oa_max = outer_a.min(), outer_a.max()
+    ob_min, ob_max = outer_b.min(), outer_b.max()
 
-    cv2.line(
-        display, (ix + iw, inner_cy),
-        (ox + ow, inner_cy), YELLOW, 2, cv2.LINE_AA
-    )
+    ia_min, ia_max = inner_a.min(), inner_a.max()
+    ib_min, ib_max = inner_b.min(), inner_b.max()
+
+    mid_a = (oa_min + oa_max) / 2
+    mid_b = (ob_min + ob_max) / 2
+
+    # Each measurement line crosses its corresponding wall.
+    wall_lines = [
+        (
+            "Left",
+            (oa_min, mid_b),
+            (ia_min, mid_b)
+        ),
+        (
+            "Right",
+            (ia_max, mid_b),
+            (oa_max, mid_b)
+        ),
+        (
+            "Top",
+            (mid_a, ob_min),
+            (mid_a, ib_min)
+        ),
+        (
+            "Bottom",
+            (mid_a, ib_max),
+            (mid_a, ob_max)
+        )
+    ]
 
     h, w = display.shape[:2]
 
-    labels = [
-        ("Top", max(5, outer_cx - 45), max(18, oy - 8)),
-        ("Bottom", max(5, outer_cx - 45),
-         min(h - 5, oy + oh + 18)),
-        ("Left", max(5, ox - 90), max(18, inner_cy - 8)),
-        ("Right", min(w - 120, ox + ow + 5),
-         max(18, inner_cy - 8))
-    ]
-
-    for label, x, y in labels:
-
-        text = (
-            f"{label}: "
-            f"{result[label]['thickness_mm']:.2f} mm"
+    for label, start, end in wall_lines:
+        p1 = point_from_local(
+            start[0], start[1], axis_a, axis_b
         )
 
+        p2 = point_from_local(
+            end[0], end[1], axis_a, axis_b
+        )
+
+        cv2.line(
+            display, p1, p2, YELLOW, 2, cv2.LINE_AA
+        )
+
+        value = result[label]["thickness_mm"]
+
+        mx = (p1[0] + p2[0]) // 2
+        my = (p1[1] + p2[1]) // 2
+
+        tx = max(3, min(w - 125, mx + 5))
+        ty = max(16, min(h - 5, my - 5))
+
         cv2.putText(
-            display, text, (x, y),
+            display,
+            f"{label}: {value:.2f} mm",
+            (tx, ty),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.42, YELLOW, 1, cv2.LINE_AA
+            0.40,
+            YELLOW,
+            1,
+            cv2.LINE_AA
         )
 
     return result
@@ -221,7 +336,6 @@ def draw_wall_measurements(display, outer_contour, inner_contour):
 # ============================================================
 
 def detect_red_part(hsv):
-
     lower_red1 = np.array([0, 70, 70])
     upper_red1 = np.array([15, 255, 255])
 
@@ -247,16 +361,14 @@ def detect_red_part(hsv):
 
 
 # ============================================================
-# INNER SQUARE DETECTION
+# ROTATION-TOLERANT INNER SQUARE DETECTION
 # ============================================================
 
 def find_inner_square(contours, hierarchy, best_part):
-
     if hierarchy is None:
         return None
 
     hierarchy_data = hierarchy[0]
-
     part_contour = contours[best_part]
     part_area = cv2.contourArea(part_contour)
 
@@ -265,106 +377,137 @@ def find_inner_square(contours, hierarchy, best_part):
     if part_area <= 0 or pw <= 0 or ph <= 0:
         return None
 
+    # Use the rotated outer rectangle's center.
+    outer_rect = cv2.minAreaRect(part_contour)
+    part_cx, part_cy = outer_rect[0]
+
+    outer_side_a, outer_side_b = outer_rect[1]
+
+    if min(outer_side_a, outer_side_b) <= 0:
+        return None
+
     candidates = []
 
     for i, contour in enumerate(contours):
-
         if hierarchy_data[i][3] != best_part:
             continue
 
         area = cv2.contourArea(contour)
 
-        if area <= 0:
+        if area <= 0 or area / part_area < MIN_HOLE_AREA_RATIO:
             continue
 
-        hx, hy, hw, hh = cv2.boundingRect(contour)
+        inner_rect = cv2.minAreaRect(contour)
+        (hole_cx, hole_cy), (rw, rh), _ = inner_rect
 
-        if hw < MIN_INNER_DIMENSION or hh < MIN_INNER_DIMENSION:
+        if rw <= 0 or rh <= 0:
             continue
 
-        if area / part_area < MIN_HOLE_AREA_RATIO:
+        # Test the rotated dimensions, not the axis-aligned box.
+        if min(rw, rh) < MIN_INNER_DIMENSION:
             continue
 
-        aspect = min(hw, hh) / max(hw, hh)
+        aspect = min(rw, rh) / max(rw, rh)
 
         if aspect < MIN_SQUARE_RATIO:
             continue
 
-        if hw / pw < 0.25 or hh / ph < 0.25:
-            continue
-
         if (
-            hx <= px or
-            hy <= py or
-            hx + hw >= px + pw or
-            hy + hh >= py + ph
+            rw / max(outer_side_a, outer_side_b) < 0.20 or
+            rh / max(outer_side_a, outer_side_b) < 0.20
         ):
             continue
 
-        part_cx = px + pw / 2
-        part_cy = py + ph / 2
-
-        hole_cx = hx + hw / 2
-        hole_cy = hy + hh / 2
-
-        if abs(hole_cx - part_cx) / pw > MAX_CENTER_OFFSET_RATIO:
-            continue
-
-        if abs(hole_cy - part_cy) / ph > MAX_CENTER_OFFSET_RATIO:
-            continue
-
-        candidates.append(
-            (area, i, hx, hy, hw, hh)
+        # Center offset measured in image pixels relative to
+        # the outer rotated rectangle's size.
+        offset_limit = MAX_CENTER_OFFSET_RATIO * max(
+            outer_side_a, outer_side_b
         )
+
+        if (
+            abs(hole_cx - part_cx) > offset_limit or
+            abs(hole_cy - part_cy) > offset_limit
+        ):
+            continue
+
+        # Confirm that the candidate is actually inside the
+        # outer contour rather than just inside its bounding box.
+        test_point = (float(hole_cx), float(hole_cy))
+
+        if cv2.pointPolygonTest(
+            part_contour, test_point, False
+        ) < 0:
+            continue
+
+        candidates.append((area, contour))
 
     if not candidates:
         return None
 
     candidates.sort(key=lambda item: item[0], reverse=True)
 
-    _, index, hx, hy, hw, hh = candidates[0]
+    hole_contour = candidates[0][1]
 
-    return contours[index], hx, hy, hw, hh
+    inner_rect = cv2.minAreaRect(hole_contour)
+    (cx, cy), (rw, rh), _ = inner_rect
+
+    return (
+        hole_contour,
+        inner_rect,
+        float(cx),
+        float(cy),
+        float(rw),
+        float(rh)
+    )
 
 
 # ============================================================
-# CYLINDER DETECTION
+# ROTATION-AWARE CYLINDER DETECTION
 # ============================================================
 
-def detect_white_cylinder(hsv, hx, hy, hw, hh):
-
-    if hw <= 0 or hh <= 0:
-        return None
-
+def detect_white_cylinder(hsv, inner_contour):
+    """
+    Searches for a light-colored cylinder inside the rotated
+    inner opening. The mask is clipped to the rotated polygon.
+    """
     image_h, image_w = hsv.shape[:2]
 
-    inset_x = max(3, int(hw * CYLINDER_INSET_RATIO))
-    inset_y = max(3, int(hh * CYLINDER_INSET_RATIO))
+    inner_rect = cv2.minAreaRect(inner_contour)
+    corners = cv2.boxPoints(inner_rect).astype(np.float32)
 
-    sx1 = max(0, hx + inset_x)
-    sy1 = max(0, hy + inset_y)
-    sx2 = min(image_w, hx + hw - inset_x)
-    sy2 = min(image_h, hy + hh - inset_y)
+    center = corners.mean(axis=0)
 
-    if sx2 <= sx1 or sy2 <= sy1:
+    # Shrink the search polygon inward to avoid the red walls.
+    inset_scale = 1.0 - 2.0 * CYLINDER_INSET_RATIO
+
+    if inset_scale <= 0:
         return None
 
-    # White/light gray mask
+    inset_corners = (
+        center + (corners - center) * inset_scale
+    )
+
+    inset_corners_int = np.round(
+        inset_corners
+    ).astype(np.int32)
+
+    polygon_mask = np.zeros(
+        (image_h, image_w), dtype=np.uint8
+    )
+
+    cv2.fillConvexPoly(
+        polygon_mask, inset_corners_int, 255
+    )
+
     light_mask = cv2.inRange(
         hsv,
         np.array([0, 0, WHITE_MIN_BRIGHTNESS]),
         np.array([180, WHITE_MAX_SATURATION, 255])
     )
 
-    # Limit search to the inner square
-    roi_mask = np.zeros(
-        (image_h, image_w),
-        dtype=np.uint8
+    light_mask = cv2.bitwise_and(
+        light_mask, polygon_mask
     )
-
-    roi_mask[sy1:sy2, sx1:sx2] = 255
-
-    light_mask = cv2.bitwise_and(light_mask, roi_mask)
 
     light_mask = cv2.morphologyEx(
         light_mask,
@@ -385,16 +528,17 @@ def detect_white_cylinder(hsv, hx, hy, hw, hh):
         cv2.CHAIN_APPROX_SIMPLE
     )
 
+    _, (rw, rh), _ = inner_rect
+
     min_area = max(
         CYLINDER_MIN_AREA,
-        int(hw * hh * MIN_CYLINDER_AREA_RATIO)
+        int(rw * rh * MIN_CYLINDER_AREA_RATIO)
     )
 
     best_contour = None
     best_area = 0
 
     for contour in contours:
-
         area = cv2.contourArea(contour)
 
         if area < min_area:
@@ -417,7 +561,12 @@ def detect_white_cylinder(hsv, hx, hy, hw, hh):
         if radius < MIN_CYLINDER_RADIUS:
             continue
 
-        if not (sx1 <= cx <= sx2 and sy1 <= cy <= sy2):
+        # Confirm the detected center lies inside the opening.
+        if cv2.pointPolygonTest(
+            inner_contour,
+            (float(cx), float(cy)),
+            False
+        ) < 0:
             continue
 
         if area > best_area:
@@ -432,7 +581,6 @@ def detect_white_cylinder(hsv, hx, hy, hw, hh):
 # ============================================================
 
 def process_frame(frame):
-
     frame_h, frame_w = frame.shape[:2]
 
     x1 = max(0, min(X1, frame_w))
@@ -441,34 +589,18 @@ def process_frame(frame):
     y2 = max(0, min(Y2, frame_h))
 
     if x2 <= x1 or y2 <= y1:
+        update_measurements(camera="ERROR")
         return frame
 
+    # Crop the inspection region, as in your original script.
     roi = frame[y1:y2, x1:x2].copy()
     display = roi.copy()
 
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-
-    # Every frame starts with fresh measurements.
-    current = {
-        "camera": "LIVE",
-        "part_detected": False,
-        "inner_square_detected": False,
-        "length": None,
-        "width": None,
-        "inner_area": None,
-        "top_wall": None,
-        "bottom_wall": None,
-        "left_wall": None,
-        "right_wall": None,
-        "cylinder_detected": False,
-        "cylinder_diameter": None,
-        "cylinder_area": None,
-        "fit_gap": None,
-        "fit_state": "WAITING"
-    }
+    current = empty_measurements()
 
     # --------------------------------------------------------
-    # FIND RED PART
+    # FIND THE RED OUTER PART
     # --------------------------------------------------------
 
     red_mask = detect_red_part(hsv)
@@ -483,9 +615,8 @@ def process_frame(frame):
     best_area = 0
 
     if hierarchy is not None:
-
         for i, contour in enumerate(contours):
-
+            # Only top-level contours are candidate outer parts.
             if hierarchy[0][i][3] != -1:
                 continue
 
@@ -495,37 +626,30 @@ def process_frame(frame):
                 best_area = area
                 best_part = i
 
-    # --------------------------------------------------------
-    # PROCESS CURRENT PART
-    # --------------------------------------------------------
-
     if best_part is None:
-
         cv2.putText(
-            display, "NO PART DETECTED",
-            (15, 30), cv2.FONT_HERSHEY_SIMPLEX,
-            0.7, RED, 2, cv2.LINE_AA
+            display,
+            "NO PART DETECTED",
+            (15, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            RED,
+            2,
+            cv2.LINE_AA
         )
 
         update_measurements(**current)
         return display
 
     part_contour = contours[best_part]
-
-    px, py, pw, ph = cv2.boundingRect(part_contour)
-
     current["part_detected"] = True
 
-    cv2.rectangle(
-        display,
-        (px, py),
-        (px + pw, py + ph),
-        YELLOW,
-        2
+    draw_rotated_outline(
+        display, part_contour, YELLOW, 2
     )
 
     # --------------------------------------------------------
-    # INNER SQUARE
+    # FIND INNER SQUARE
     # --------------------------------------------------------
 
     inner_result = find_inner_square(
@@ -533,86 +657,105 @@ def process_frame(frame):
     )
 
     if inner_result is None:
-
         cv2.putText(
-            display, "INNER SQUARE NOT FOUND",
-            (15, 30), cv2.FONT_HERSHEY_SIMPLEX,
-            0.6, RED, 2, cv2.LINE_AA
+            display,
+            "INNER SQUARE NOT FOUND",
+            (15, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            RED,
+            2,
+            cv2.LINE_AA
         )
 
         update_measurements(**current)
         return display
 
-    hole_contour, hx, hy, hw, hh = inner_result
+    (
+        hole_contour,
+        inner_rect,
+        inner_cx,
+        inner_cy,
+        inner_rw,
+        inner_rh
+    ) = inner_result
 
     current["inner_square_detected"] = True
 
-    cv2.rectangle(
+    inner_corners = cv2.boxPoints(
+        inner_rect
+    ).astype(np.int32)
+
+    cv2.polylines(
         display,
-        (hx, hy),
-        (hx + hw, hy + hh),
+        [inner_corners],
+        True,
         GREEN,
-        2
+        2,
+        cv2.LINE_AA
     )
 
-    # Original dimension formulas
-    length_mm = hw * MM_PER_PIXEL
-    width_mm = hh * MM_PER_PIXEL
+    # Rotation-aware inner dimensions.
+    length_mm = max(inner_rw, inner_rh) * MM_PER_PIXEL
+    width_mm = min(inner_rw, inner_rh) * MM_PER_PIXEL
     inner_area_mm2 = length_mm * width_mm
 
     current["length"] = round(length_mm, 2)
     current["width"] = round(width_mm, 2)
     current["inner_area"] = round(inner_area_mm2, 2)
 
-    center_x = hx + hw // 2
-    center_y = hy + hh // 2
-
+    # Draw a dimension line along one edge and its opposite edge.
     cv2.line(
-        display, (hx, center_y), (hx + hw, center_y),
-        RED, 1
+        display,
+        tuple(inner_corners[0]),
+        tuple(inner_corners[1]),
+        RED,
+        2,
+        cv2.LINE_AA
     )
 
     cv2.line(
-        display, (center_x, hy), (center_x, hy + hh),
-        RED, 1
+        display,
+        tuple(inner_corners[1]),
+        tuple(inner_corners[2]),
+        PURPLE,
+        2,
+        cv2.LINE_AA
     )
 
-    # Wall measurements
+    # --------------------------------------------------------
+    # WALL THICKNESS
+    # --------------------------------------------------------
+
     wall_measurements = draw_wall_measurements(
-        display, part_contour, hole_contour
+        display,
+        part_contour,
+        hole_contour
     )
 
     if wall_measurements:
-
         current["top_wall"] = round(
             wall_measurements["Top"]["thickness_mm"], 2
         )
-
         current["bottom_wall"] = round(
             wall_measurements["Bottom"]["thickness_mm"], 2
         )
-
         current["left_wall"] = round(
             wall_measurements["Left"]["thickness_mm"], 2
         )
-
         current["right_wall"] = round(
             wall_measurements["Right"]["thickness_mm"], 2
         )
 
     # --------------------------------------------------------
-    # CYLINDER MEASUREMENTS
+    # CYLINDER DETECTION
     # --------------------------------------------------------
 
     cylinder_contour = detect_white_cylinder(
-        hsv, hx, hy, hw, hh
+        hsv, hole_contour
     )
 
-    cylinder_diameter_mm = None
-    cylinder_area_mm2 = 0
-
     if cylinder_contour is not None:
-
         (cyl_x, cyl_y), cyl_radius = cv2.minEnclosingCircle(
             cylinder_contour
         )
@@ -633,35 +776,39 @@ def process_frame(frame):
             cylinder_area_mm2, 2
         )
 
-        # Preserve original fit-gap formula and threshold
+        # Original fit-gap formula and threshold preserved.
         fit_gap = inner_area_mm2 - cylinder_area_mm2
 
-        fit_state = (
+        current["fit_gap"] = round(fit_gap, 2)
+        current["fit_state"] = (
             "PASS"
-            if 0 <= fit_gap <= 160
+            if 0 <= fit_gap <= MAX_FIT_GAP_MM2
             else "FAIL"
         )
 
-        current["fit_gap"] = round(fit_gap, 2)
-        current["fit_state"] = fit_state
-
-        cyl_center = (
+        center = (
             int(round(cyl_x)),
             int(round(cyl_y))
         )
 
-        radius_draw = int(round(cyl_radius))
-
         cv2.circle(
-            display, cyl_center, radius_draw,
-            CYAN, 2, cv2.LINE_AA
+            display,
+            center,
+            int(round(cyl_radius)),
+            CYAN,
+            2,
+            cv2.LINE_AA
         )
 
+        # Draw the cylinder diameter through its center.
+        dx = int(round(cyl_radius))
         cv2.line(
             display,
-            (int(cyl_x - cyl_radius), int(cyl_y)),
-            (int(cyl_x + cyl_radius), int(cyl_y)),
-            PURPLE, 2, cv2.LINE_AA
+            (center[0] - dx, center[1]),
+            (center[0] + dx, center[1]),
+            PURPLE,
+            2,
+            cv2.LINE_AA
         )
 
 
@@ -669,9 +816,7 @@ def process_frame(frame):
     else:
         current["fit_state"] = "NO CYLINDER"
 
-    # Publish fresh measurements for the browser.
     update_measurements(**current)
-
     return display
 
 
@@ -680,15 +825,12 @@ def process_frame(frame):
 # ============================================================
 
 def camera_worker():
-
     global latest_jpeg
 
     cap = cv2.VideoCapture(CAMERA_NUMBER)
 
     if not cap.isOpened():
-
         update_measurements(camera="ERROR")
-
         print("ERROR: Could not open camera.")
         return
 
@@ -697,11 +839,9 @@ def camera_worker():
     print("Camera started.")
 
     while True:
-
         ret, frame = cap.read()
 
         if not ret:
-
             update_measurements(camera="ERROR")
             time.sleep(0.1)
             continue
@@ -716,12 +856,10 @@ def camera_worker():
             )
 
             if success:
-
                 with data_lock:
                     latest_jpeg = encoded.tobytes()
 
         except Exception as exc:
-
             print("Frame processing error:", exc)
             time.sleep(0.05)
 
@@ -729,13 +867,11 @@ def camera_worker():
 
 
 # ============================================================
-# VIDEO STREAM
+# LIVE VIDEO STREAM
 # ============================================================
 
 def generate_video():
-
     while True:
-
         with data_lock:
             frame_bytes = latest_jpeg
 
@@ -778,12 +914,9 @@ HTML_PAGE = r"""
     --green: #36d399;
     --red: #ff646e;
     --yellow: #f4c95d;
-    --blue: #70a7ff;
 }
 
-* {
-    box-sizing: border-box;
-}
+* { box-sizing: border-box; }
 
 body {
     margin: 0;
@@ -794,41 +927,22 @@ body {
 
 header {
     display: flex;
-    align-items: center;
     justify-content: space-between;
+    align-items: center;
     padding: 20px 28px;
     border-bottom: 1px solid var(--border);
     background: #10151d;
 }
 
-.brand {
-    display: flex;
-    align-items: center;
-    gap: 13px;
-}
-
-.brand-icon {
-    width: 39px;
-    height: 39px;
-    display: grid;
-    place-items: center;
-    border-radius: 10px;
-    color: var(--green);
-    background: #19332d;
-    font-size: 22px;
-}
-
 h1 {
     margin: 0;
-    font-size: 19px;
-    font-weight: 650;
-    letter-spacing: -0.3px;
+    font-size: 20px;
 }
 
 .subtitle {
+    margin-top: 5px;
     color: var(--muted);
     font-size: 12px;
-    margin-top: 4px;
 }
 
 .live-status {
@@ -842,33 +956,14 @@ h1 {
 .dot {
     width: 8px;
     height: 8px;
-    background: var(--green);
     border-radius: 50%;
-    box-shadow: 0 0 10px #36d39955;
+    background: var(--yellow);
 }
 
 main {
     max-width: 1500px;
     margin: auto;
     padding: 25px 28px 35px;
-}
-
-.section-heading {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 15px;
-}
-
-h2 {
-    font-size: 15px;
-    margin: 0;
-    font-weight: 600;
-}
-
-.section-note {
-    color: var(--muted);
-    font-size: 12px;
 }
 
 .layout {
@@ -886,7 +981,7 @@ h2 {
 }
 
 .card-header {
-    padding: 16px 18px;
+    padding: 15px 18px;
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -911,13 +1006,15 @@ h2 {
     display: flex;
     justify-content: center;
     align-items: center;
-    min-height: 280px;
+    min-height: 220px;
 }
 
+/* Change max-width here to shrink the live camera feed. */
 .camera-wrap img {
-    width: 100%;
-    height: auto;
     display: block;
+    width: 100%;
+    max-width: 100%;
+    height: auto;
 }
 
 .camera-footer {
@@ -954,17 +1051,9 @@ h2 {
     font-weight: 700;
 }
 
-.result-value.pass {
-    color: var(--green);
-}
-
-.result-value.fail {
-    color: var(--red);
-}
-
-.result-value.wait {
-    color: var(--yellow);
-}
+.pass { color: var(--green); }
+.fail { color: var(--red); }
+.wait { color: var(--yellow); }
 
 .measure-grid {
     display: grid;
@@ -990,7 +1079,6 @@ h2 {
 .metric-value {
     font-size: 21px;
     font-weight: 650;
-    letter-spacing: -0.5px;
     overflow-wrap: anywhere;
 }
 
@@ -1001,9 +1089,7 @@ h2 {
     margin-left: 3px;
 }
 
-.wall-list {
-    padding: 4px 18px 12px;
-}
+.wall-list { padding: 4px 18px 12px; }
 
 .wall-row {
     display: flex;
@@ -1014,18 +1100,9 @@ h2 {
     font-size: 12px;
 }
 
-.wall-row:last-child {
-    border-bottom: none;
-}
-
-.wall-label {
-    color: var(--muted);
-}
-
-.wall-value {
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-}
+.wall-row:last-child { border-bottom: none; }
+.wall-label { color: var(--muted); }
+.wall-value { font-weight: 600; }
 
 .footer {
     color: var(--muted);
@@ -1035,35 +1112,23 @@ h2 {
 }
 
 @media (max-width: 900px) {
-    .layout {
-        grid-template-columns: 1fr;
-    }
-
-    main {
-        padding: 18px 14px;
-    }
-
-    header {
-        padding: 16px;
-    }
+    .layout { grid-template-columns: 1fr; }
+    main { padding: 18px 14px; }
+    header { padding: 16px; }
 }
 
 @media (max-width: 480px) {
-    .section-note {
-        display: none;
-    }
-
-    .result-value {
-        font-size: 22px;
-    }
+    .result-value { font-size: 22px; }
 }
 </style>
 </head>
 
 <body>
-
 <header>
+    <div>
 
+
+    </div>
 
     <div class="live-status">
         <span class="dot" id="statusDot"></span>
@@ -1072,16 +1137,11 @@ h2 {
 </header>
 
 <main>
-
-    <div class="section-heading">
-        <span class="section-note">Measurements refresh automatically</span>
-    </div>
-
     <div class="layout">
 
-        <!-- LIVE CAMERA -->
         <section class="card">
             <div class="card-header">
+                <span class="card-title">Camera inspection</span>
                 <span class="tag">LIVE FEED</span>
             </div>
 
@@ -1097,7 +1157,6 @@ h2 {
 
         <div class="right-column">
 
-            <!-- INSPECTION RESULT -->
             <section class="card">
                 <div class="result-banner">
                     <div class="result-label">Inspection result</div>
@@ -1107,7 +1166,6 @@ h2 {
                 </div>
 
                 <div class="measure-grid">
-
                     <div class="metric">
                         <div class="metric-label">Length</div>
                         <div class="metric-value">
@@ -1139,11 +1197,9 @@ h2 {
                             <span class="unit">mm²</span>
                         </div>
                     </div>
-
                 </div>
             </section>
 
-            <!-- WALL THICKNESS -->
             <section class="card">
                 <div class="card-header">
                     <span class="card-title">Wall thickness</span>
@@ -1155,17 +1211,14 @@ h2 {
                         <span class="wall-label">Top wall</span>
                         <span class="wall-value" id="topWall">-- mm</span>
                     </div>
-
                     <div class="wall-row">
                         <span class="wall-label">Bottom wall</span>
                         <span class="wall-value" id="bottomWall">-- mm</span>
                     </div>
-
                     <div class="wall-row">
                         <span class="wall-label">Left wall</span>
                         <span class="wall-value" id="leftWall">-- mm</span>
                     </div>
-
                     <div class="wall-row">
                         <span class="wall-label">Right wall</span>
                         <span class="wall-value" id="rightWall">-- mm</span>
@@ -1173,14 +1226,12 @@ h2 {
                 </div>
             </section>
 
-            <!-- CYLINDER -->
             <section class="card">
                 <div class="card-header">
                     <span class="card-title">Cylinder inspection</span>
                 </div>
 
                 <div class="measure-grid">
-
                     <div class="metric">
                         <div class="metric-label">Detection</div>
                         <div class="metric-value" id="cylinderStatus"
@@ -1196,7 +1247,6 @@ h2 {
                             <span class="unit">mm</span>
                         </div>
                     </div>
-
                 </div>
             </section>
 
@@ -1205,23 +1255,19 @@ h2 {
 
     <div class="footer">
         Live vision processing · Calibration:
-        <span id="calibration">0.24654524 mm/pixel</span>
+        <span id="calibration">0.36339648 mm/pixel</span>
         · <span id="lastUpdate">Waiting for camera</span>
     </div>
-
 </main>
 
 <script>
-function setText(id, value, suffix = "") {
-    const el = document.getElementById(id);
-    el.textContent =
-        value === null || value === undefined ? "--" : value + suffix;
+function fmt(value, decimals = 2) {
+    if (value === null || value === undefined) return "--";
+    return Number(value).toFixed(decimals);
 }
 
-function formatValue(value) {
-    return value === null || value === undefined
-        ? "--"
-        : Number(value).toFixed(2);
+function setText(id, value) {
+    document.getElementById(id).textContent = value;
 }
 
 async function refreshMeasurements() {
@@ -1236,67 +1282,65 @@ async function refreshMeasurements() {
 
         const d = await response.json();
 
-        document.getElementById("connectionStatus").textContent =
-            d.camera === "LIVE" ? "Camera connected" : "Camera unavailable";
+        setText(
+            "connectionStatus",
+            d.camera === "LIVE" ? "Camera connected" : "Camera unavailable"
+        );
 
         document.getElementById("statusDot").style.background =
             d.camera === "LIVE" ? "var(--green)" : "var(--red)";
 
-        document.getElementById("partStatus").textContent =
+        setText(
+            "partStatus",
             d.part_detected
                 ? (d.inner_square_detected
                     ? "Part detected · Inner square found"
                     : "Part detected · Inner square missing")
-                : "No part detected";
+                : "No part detected"
+        );
 
-        setText("length", formatValue(d.length));
-        setText("width", formatValue(d.width));
-        setText("innerArea",
-            d.inner_area === null ? "--" : Number(d.inner_area).toFixed(1));
-        setText("fitGap",
-            d.fit_gap === null ? "--" : Number(d.fit_gap).toFixed(1));
+        setText("length", fmt(d.length));
+        setText("width", fmt(d.width));
+        setText("innerArea", fmt(d.inner_area, 1));
+        setText("fitGap", fmt(d.fit_gap, 1));
 
         setText("topWall",
-            d.top_wall === null ? "--" : formatValue(d.top_wall), " mm");
+            d.top_wall === null ? "-- mm" : fmt(d.top_wall) + " mm");
         setText("bottomWall",
-            d.bottom_wall === null ? "--" : formatValue(d.bottom_wall), " mm");
+            d.bottom_wall === null ? "-- mm" : fmt(d.bottom_wall) + " mm");
         setText("leftWall",
-            d.left_wall === null ? "--" : formatValue(d.left_wall), " mm");
+            d.left_wall === null ? "-- mm" : fmt(d.left_wall) + " mm");
         setText("rightWall",
-            d.right_wall === null ? "--" : formatValue(d.right_wall), " mm");
+            d.right_wall === null ? "-- mm" : fmt(d.right_wall) + " mm");
 
-        setText("cylinderDiameter",
-            d.cylinder_diameter === null
-                ? "--"
-                : formatValue(d.cylinder_diameter));
+        setText("cylinderDiameter", fmt(d.cylinder_diameter));
 
-        document.getElementById("cylinderStatus").textContent =
-            d.cylinder_detected ? "Detected" : "Not detected";
+        setText(
+            "cylinderStatus",
+            d.cylinder_detected ? "Detected" : "Not detected"
+        );
 
         const fit = document.getElementById("fitState");
         fit.textContent = d.fit_state;
-
         fit.className = "result-value " +
             (d.fit_state === "PASS" ? "pass" :
              d.fit_state === "FAIL" ? "fail" : "wait");
 
-        document.getElementById("lastUpdate").textContent =
-            "Updated " + new Date(d.updated * 1000).toLocaleTimeString();
+        setText(
+            "lastUpdate",
+            "Updated " + new Date(d.updated * 1000).toLocaleTimeString()
+        );
 
     } catch (error) {
-        document.getElementById("connectionStatus").textContent =
-            "Reconnecting";
-
+        setText("connectionStatus", "Reconnecting");
         document.getElementById("statusDot").style.background =
             "var(--red)";
     }
 }
 
-// Poll measurements without reloading the page.
 refreshMeasurements();
 setInterval(refreshMeasurements, 250);
 </script>
-
 </body>
 </html>
 """
@@ -1325,7 +1369,6 @@ def video_feed():
 
 @app.route("/measurements")
 def get_measurements():
-
     with data_lock:
         data = measurements.copy()
 
@@ -1337,7 +1380,6 @@ def get_measurements():
 # ============================================================
 
 if __name__ == "__main__":
-
     camera_thread = threading.Thread(
         target=camera_worker,
         daemon=True
